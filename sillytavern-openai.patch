@@ -1,0 +1,779 @@
+diff --git a/src/aistudio_api/api/app.py b/src/aistudio_api/api/app.py
+index 8925cc289712192c635d398bd47eaf4086614cd6..19008edffeb74bfae06dc0696c0d894ba95838b7 100644
+--- a/src/aistudio_api/api/app.py
++++ b/src/aistudio_api/api/app.py
+@@ -30,6 +30,11 @@ from .dependencies import require_api_key, require_web_auth
+ from .routes_accounts import router as accounts_router
+ from .routes_gemini import router as gemini_router
+ from .routes_models import router as models_router
++from .routes_openai import (
++    openai_error_payload,
++    openai_error_response,
++    router as openai_router,
++)
+ from .routes_system import (
+     protected_router as system_protected_router,
+     public_router as system_public_router,
+@@ -156,10 +161,13 @@ app.include_router(accounts_router, prefix="/api", dependencies=[Depends(require
+ app.include_router(accounts_router, dependencies=[Depends(require_web_auth)])
+ app.include_router(gemini_router, dependencies=[Depends(require_api_key)])
+ app.include_router(models_router, dependencies=[Depends(require_api_key)])
++app.include_router(openai_router, dependencies=[Depends(require_api_key)])
+ 
+ 
+ @app.exception_handler(HTTPException)
+ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
++    if _request.url.path.startswith("/v1/"):
++        return openai_error_response(exc)
+     code, msg, status_str = classify_gemini_error_payload(exc)
+     return JSONResponse(
+         status_code=code,
+@@ -178,6 +186,10 @@ async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONR
+ async def validation_exception_handler(
+     _request: Request, exc: RequestValidationError
+ ) -> JSONResponse:
++    if _request.url.path.startswith("/v1/"):
++        return JSONResponse(
++            status_code=400, content=openai_error_payload(str(exc), 400)
++        )
+     code, msg, status_str = 400, str(exc), "INVALID_ARGUMENT"
+     return JSONResponse(
+         status_code=code,
+@@ -328,6 +340,7 @@ async def spa_navigation_middleware(request: Request, call_next):
+         (
+             "/api",
+             "/v1beta",
++            "/v1/",
+             "/auth",
+             "/assets",
+             "/static",
+diff --git a/src/aistudio_api/api/routes_openai.py b/src/aistudio_api/api/routes_openai.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1e8a857030ceb13cb0ebd3922f9d264d2b9f225
+--- /dev/null
++++ b/src/aistudio_api/api/routes_openai.py
+@@ -0,0 +1,337 @@
++"""Text-only OpenAI compatibility over the existing Gemini request lifecycle."""
++
++from __future__ import annotations
++
++import json
++import time
++import uuid
++from collections.abc import AsyncGenerator, Mapping
++from typing import Literal
++
++from fastapi import APIRouter, Depends, HTTPException
++from fastapi.responses import JSONResponse, StreamingResponse
++from pydantic import BaseModel, Field, field_validator
++
++from aistudio_api.application.api_service_gemini import (
++    classify_gemini_error_payload,
++    handle_gemini_generate_content,
++)
++from aistudio_api.infrastructure.gateway.client import AIStudioClient
++from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
++
++from .dependencies import get_client, get_runtime_state
++from .response_models import GeminiGenerateContentResponse, GeminiUsageMetadata
++from .schemas import (
++    GeminiContent,
++    GeminiGenerateContentRequest,
++    GeminiGenerationConfig,
++    GeminiPart,
++)
++from .state import RuntimeState
++
++router = APIRouter(prefix="/v1")
++
++
++class TextPart(BaseModel):
++    type: Literal["text"]
++    text: str
++
++
++class ChatMessage(BaseModel):
++    role: Literal["system", "developer", "user", "assistant"]
++    content: str | list[TextPart]
++    tool_calls: list[object] = Field(default_factory=list, max_length=0)
++    function_call: None = None
++
++
++class StreamOptions(BaseModel):
++    include_usage: bool = False
++
++
++class ChatRequest(BaseModel):
++    model: str = Field(min_length=1, max_length=200)
++    messages: list[ChatMessage] = Field(min_length=1)
++    stream: bool = False
++    stream_options: StreamOptions | None = None
++    temperature: float | None = Field(default=None, ge=0, le=2)
++    top_p: float | None = Field(default=None, ge=0, le=1)
++    max_tokens: int | None = Field(default=None, gt=0)
++    max_completion_tokens: int | None = Field(default=None, gt=0)
++    stop: str | list[str] | None = None
++    n: Literal[1] = 1
++    tools: list[object] = Field(default_factory=list, max_length=0)
++    functions: list[object] = Field(default_factory=list, max_length=0)
++    tool_choice: Literal["none"] | None = None
++    function_call: Literal["none"] | None = None
++    response_format: dict[str, object] | None = None
++
++    @field_validator("model")
++    @classmethod
++    def validate_model(cls, value: str) -> str:
++        value = value.strip().removeprefix("models/")
++        if not value:
++            raise ValueError("model must not be empty")
++        return value
++
++    @field_validator("response_format")
++    @classmethod
++    def validate_response_format(
++        cls, value: dict[str, object] | None
++    ) -> dict[str, object] | None:
++        if value is not None and value != {"type": "text"}:
++            raise ValueError("Only text response_format is supported")
++        return value
++
++
++def openai_error_payload(message: str, code: int) -> dict[str, object]:
++    error_type = (
++        "authentication_error"
++        if code in (401, 403)
++        else "rate_limit_error"
++        if code == 429
++        else "server_error"
++        if code >= 500
++        else "invalid_request_error"
++    )
++    return {
++        "error": {"message": message, "type": error_type, "param": None, "code": code}
++    }
++
++
++def openai_error_response(exc: HTTPException) -> JSONResponse:
++    code, message, _ = classify_gemini_error_payload(exc)
++    return JSONResponse(
++        status_code=code,
++        content=openai_error_payload(message, code),
++        headers=exc.headers,
++    )
++
++
++def _is_text_model(model: Mapping[str, object]) -> bool:
++    name = str(model.get("id") or model.get("name") or "").lower()
++    return not any(
++        model.get(flag)
++        for flag in ("is_image_model", "is_video_model", "is_audio_model")
++    ) and not any(
++        word in name
++        for word in ("image", "imagen", "banana", "veo", "lyria", "tts", "transcribe")
++    )
++
++
++@router.get("/models")
++async def list_models(
++    runtime_state: RuntimeState = Depends(get_runtime_state),
++) -> dict[str, object]:
++    session = runtime_state.client.session if runtime_state.client else None
++    models = await model_discovery.get_models(session=session)
++    return {
++        "object": "list",
++        "data": [
++            {
++                "id": str(model.get("id") or model.get("name") or "").removeprefix(
++                    "models/"
++                ),
++                "object": "model",
++                "created": 0,
++                "owned_by": "google",
++            }
++            for model in models
++            if _is_text_model(model)
++        ],
++    }
++
++
++def to_gemini_request(req: ChatRequest) -> GeminiGenerateContentRequest:
++    contents: list[GeminiContent] = []
++    instructions: list[GeminiPart] = []
++    for message in req.messages:
++        text = (
++            message.content
++            if isinstance(message.content, str)
++            else "".join(part.text for part in message.content)
++        )
++        parts = [GeminiPart(text=text)]
++        if message.role in ("system", "developer"):
++            instructions.extend(parts)
++            continue
++        role = "model" if message.role == "assistant" else "user"
++        if contents and contents[-1].role == role:
++            contents[-1].parts.extend(parts)
++        else:
++            contents.append(GeminiContent(role=role, parts=parts))
++    if not contents or not any(item.role == "user" for item in contents):
++        raise HTTPException(400, detail="messages must include a user message")
++    if contents[-1].role == "model":
++        # AI Studio rejects model-final histories. Preserve them and request continuation;
++        # this is not exact assistant-prefix completion, which the upstream cannot provide.
++        contents.append(
++            GeminiContent(
++                role="user",
++                parts=[
++                    GeminiPart(
++                        text="Continue according to the instructions and requested output format above."
++                    )
++                ],
++            )
++        )
++    stop = [req.stop] if isinstance(req.stop, str) else req.stop
++    return GeminiGenerateContentRequest(
++        contents=contents,
++        systemInstruction=GeminiContent(parts=instructions) if instructions else None,
++        # An explicit empty list prevents configured search/tool defaults in this text-only API.
++        tools=[],
++        generationConfig=GeminiGenerationConfig(
++            temperature=req.temperature,
++            topP=req.top_p,
++            maxOutputTokens=req.max_completion_tokens
++            if req.max_completion_tokens is not None
++            else req.max_tokens,
++            stopSequences=stop,
++        ),
++    )
++
++
++def _finish_reason(reason: str | None) -> str:
++    if reason == "MAX_TOKENS":
++        return "length"
++    if reason in (
++        "SAFETY",
++        "RECITATION",
++        "BLOCKLIST",
++        "PROHIBITED_CONTENT",
++        "SPII",
++        "IMAGE_SAFETY",
++    ):
++        return "content_filter"
++    return "stop"
++
++
++def _usage(usage: GeminiUsageMetadata | None) -> dict[str, object]:
++    usage = usage or GeminiUsageMetadata()
++    return {
++        "prompt_tokens": usage.promptTokenCount,
++        "completion_tokens": usage.candidatesTokenCount,
++        "total_tokens": usage.totalTokenCount,
++        "completion_tokens_details": {"reasoning_tokens": usage.thoughtsTokenCount},
++        "prompt_tokens_details": {"cached_tokens": usage.cachedContentTokenCount or 0},
++    }
++
++
++def _visible_text(response: GeminiGenerateContentResponse) -> str:
++    return "".join(
++        part.text
++        for candidate in response.candidates
++        for part in candidate.content.parts
++        if part.text and not part.thought
++    )
++
++
++def _sse(payload: dict[str, object]) -> str:
++    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
++
++
++async def _stream_openai(
++    upstream: StreamingResponse,
++    *,
++    model: str,
++    completion_id: str,
++    created: int,
++    include_usage: bool,
++) -> AsyncGenerator[str, None]:
++    base: dict[str, object] = {
++        "id": completion_id,
++        "object": "chat.completion.chunk",
++        "created": created,
++        "model": model,
++    }
++
++    def chunk(delta: dict[str, str], finish_reason: str | None = None) -> str:
++        return _sse(
++            {
++                **base,
++                "choices": [
++                    {"index": 0, "delta": delta, "finish_reason": finish_reason}
++                ],
++                **({"usage": None} if include_usage else {}),
++            }
++        )
++
++    iterator = upstream.body_iterator.__aiter__()
++    try:
++        yield chunk({"role": "assistant", "content": ""})
++        finished = False
++        async for event in iterator:
++            # Internal Gemini iterator yields one complete SSE event per item; no HTTP re-request.
++            text = event if isinstance(event, str) else bytes(event).decode("utf-8")
++            payload = json.loads(text.removeprefix("data: ").strip())
++            if "error" in payload:
++                error = payload["error"]
++                yield _sse(
++                    openai_error_payload(str(error["message"]), int(error["code"]))
++                )
++                yield "data: [DONE]\n\n"
++                return
++            response = GeminiGenerateContentResponse.model_validate(payload)
++            content = _visible_text(response)
++            if content:
++                yield chunk({"content": content})
++            for candidate in response.candidates:
++                if candidate.finishReason:
++                    yield chunk({}, _finish_reason(candidate.finishReason))
++                    finished = True
++            if response.usageMetadata and include_usage:
++                yield _sse(
++                    {**base, "choices": [], "usage": _usage(response.usageMetadata)}
++                )
++        if not finished:
++            yield _sse(
++                openai_error_payload("Upstream stream ended without a completion", 502)
++            )
++        yield "data: [DONE]\n\n"
++    finally:
++        close = getattr(iterator, "aclose", None)
++        if close is not None:
++            await close()
++
++
++@router.post("/chat/completions", response_model=None)
++async def chat_completions(
++    req: ChatRequest,
++    client: AIStudioClient = Depends(get_client),
++) -> dict[str, object] | StreamingResponse:
++    gemini_req = to_gemini_request(req)
++    completion_id = "chatcmpl-" + uuid.uuid4().hex
++    created = int(time.time())
++    response = await handle_gemini_generate_content(
++        req.model, gemini_req, client, stream=req.stream
++    )
++    if isinstance(response, StreamingResponse):
++        return StreamingResponse(
++            _stream_openai(
++                response,
++                model=req.model,
++                completion_id=completion_id,
++                created=created,
++                include_usage=bool(
++                    req.stream_options and req.stream_options.include_usage
++                ),
++            ),
++            media_type="text/event-stream",
++            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
++        )
++    return {
++        "id": completion_id,
++        "object": "chat.completion",
++        "created": created,
++        "model": req.model,
++        "choices": [
++            {
++                "index": 0,
++                "message": {"role": "assistant", "content": _visible_text(response)},
++                "finish_reason": _finish_reason(
++                    response.candidates[0].finishReason if response.candidates else None
++                ),
++            }
++        ],
++        "usage": _usage(response.usageMetadata),
++    }
+diff --git a/tests/unit/test_openai_compat.py b/tests/unit/test_openai_compat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..81d7da0cc9e3922651a7809bf0e56d1da6a92fce
+--- /dev/null
++++ b/tests/unit/test_openai_compat.py
+@@ -0,0 +1,358 @@
++"""Exercise the HTTP compatibility boundary without Google credentials or network."""
++
++import json
++from unittest.mock import AsyncMock
++
++import httpx
++import pytest
++from fastapi import HTTPException
++from fastapi.responses import StreamingResponse
++
++from aistudio_api.api import routes_openai
++from aistudio_api.api.app import app
++from aistudio_api.api.dependencies import get_client
++from aistudio_api.api.response_models import GeminiGenerateContentResponse
++from aistudio_api.application.api_service_gemini import (
++    format_sse_error,
++    format_sse_event,
++    format_sse_usage,
++)
++from aistudio_api.config import settings
++
++
++@pytest.fixture
++def client_stub(monkeypatch):
++    monkeypatch.setattr(settings, "api_keys", frozenset())
++    stub = object()
++    app.dependency_overrides[get_client] = lambda: stub
++    yield stub
++    app.dependency_overrides.pop(get_client, None)
++
++
++def _client():
++    return httpx.AsyncClient(
++        transport=httpx.ASGITransport(app=app), base_url="http://test"
++    )
++
++
++def _payload(**kwargs):
++    return {
++        "model": "gemini-3.8-flash",
++        "messages": [{"role": "user", "content": "Hello"}],
++        **kwargs,
++    }
++
++
++def _gemini_reply():
++    return GeminiGenerateContentResponse.model_validate(
++        {
++            "candidates": [
++                {
++                    "content": {
++                        "parts": [
++                            {"text": "private reasoning", "thought": True},
++                            {"text": "你好"},
++                        ]
++                    },
++                    "finishReason": "MAX_TOKENS",
++                }
++            ],
++            "usageMetadata": {
++                "promptTokenCount": 10,
++                "candidatesTokenCount": 8,
++                "thoughtsTokenCount": 5,
++                "totalTokenCount": 18,
++            },
++        }
++    )
++
++
++@pytest.mark.asyncio
++async def test_models_json_for_browser_and_authentication(monkeypatch, client_stub):
++    monkeypatch.setattr(
++        routes_openai.model_discovery,
++        "get_models",
++        AsyncMock(
++            return_value=[
++                {"id": "models/text-model"},
++                {"id": "image-model", "is_image_model": True},
++                {"id": "audio-model", "is_audio_model": True},
++            ]
++        ),
++    )
++    monkeypatch.setattr(settings, "api_keys", frozenset({"test-secret"}))
++    async with _client() as client:
++        denied = await client.get("/v1/models")
++        assert denied.status_code == 401
++        assert denied.json()["error"]["type"] == "authentication_error"
++        result = await client.get(
++            "/v1/models",
++            headers={"Authorization": "Bearer test-secret", "Accept": "text/html"},
++        )
++        assert result.status_code == 200
++        assert result.headers["content-type"].startswith("application/json")
++        assert result.json() == {
++            "object": "list",
++            "data": [
++                {
++                    "id": "text-model",
++                    "object": "model",
++                    "created": 0,
++                    "owned_by": "google",
++                }
++            ],
++        }
++
++
++@pytest.mark.asyncio
++async def test_chat_maps_messages_parameters_reply_and_usage(monkeypatch, client_stub):
++    generate = AsyncMock(return_value=_gemini_reply())
++    monkeypatch.setattr(routes_openai, "handle_gemini_generate_content", generate)
++    request = _payload(
++        model="models/gemini-3.8-flash",
++        messages=[
++            {"role": "system", "content": "System instruction"},
++            {"role": "developer", "content": "Developer instruction"},
++            {"role": "user", "content": [{"type": "text", "text": "First"}]},
++            {"role": "user", "content": "Second"},
++            {"role": "assistant", "content": "Earlier answer"},
++            {"role": "user", "content": "Question"},
++        ],
++        temperature=0,
++        top_p=0.8,
++        max_tokens=100,
++        max_completion_tokens=200,
++        stop="END",
++    )
++    async with _client() as client:
++        result = await client.post("/v1/chat/completions", json=request)
++    assert result.status_code == 200
++    data = result.json()
++    assert data["object"] == "chat.completion"
++    assert data["choices"][0] == {
++        "index": 0,
++        "message": {"role": "assistant", "content": "你好"},
++        "finish_reason": "length",
++    }
++    assert data["usage"]["total_tokens"] == 18
++    assert data["usage"]["completion_tokens"] == 8
++    assert data["usage"]["completion_tokens_details"]["reasoning_tokens"] == 5
++    model, req, passed_client = generate.call_args.args
++    assert model == "gemini-3.8-flash"
++    assert passed_client is client_stub
++    assert generate.call_args.kwargs == {"stream": False}
++    assert [part.text for part in req.systemInstruction.parts] == [
++        "System instruction",
++        "Developer instruction",
++    ]
++    assert [content.role for content in req.contents] == ["user", "model", "user"]
++    assert [part.text for part in req.contents[0].parts] == ["First", "Second"]
++    assert req.tools == []
++    assert req.generationConfig.temperature == 0
++    assert req.generationConfig.maxOutputTokens == 200
++    assert req.generationConfig.stopSequences == ["END"]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("stream", [False, True])
++async def test_assistant_tail_keeps_history_and_adds_user_turn(
++    monkeypatch, client_stub, stream
++):
++    async def generate(model, req, client, *, stream):
++        assert [item.role for item in req.contents] == ["user", "model", "user"]
++        assert req.contents[0].parts[0].text == "Return the requested table."
++        assert [part.text for part in req.contents[1].parts] == [
++            "Earlier answer",
++            "Table prefix",
++        ]
++        assert req.contents[-1].parts[0].text
++        if stream:
++
++            async def events():
++                yield format_sse_event("body", "TABLE_OK") or ""
++                yield format_sse_usage(
++                    {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
++                )
++
++            return StreamingResponse(events())
++        return _gemini_reply()
++
++    monkeypatch.setattr(routes_openai, "handle_gemini_generate_content", generate)
++    async with _client() as client:
++        response = await client.post(
++            "/v1/chat/completions",
++            json=_payload(
++                messages=[
++                    {"role": "user", "content": "Return the requested table."},
++                    {"role": "assistant", "content": "Earlier answer"},
++                    {"role": "assistant", "content": "Table prefix"},
++                ],
++                stream=stream,
++            ),
++        )
++    assert response.status_code == 200
++    if stream:
++        assert "TABLE_OK" in response.text
++        assert response.text.endswith("data: [DONE]\n\n")
++    else:
++        assert response.json()["choices"][0]["message"]["content"] == "你好"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("include_usage", [False, True])
++async def test_stream_keeps_id_separates_thoughts_finishes_and_reports_usage(
++    monkeypatch, client_stub, include_usage
++):
++    closed = []
++
++    async def events():
++        try:
++            yield format_sse_event("thinking", "private reasoning") or ""
++            yield format_sse_event("body", "你好") or ""
++            yield format_sse_event("body", "世界") or ""
++            yield format_sse_usage(
++                {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
++            )
++        finally:
++            closed.append(True)
++
++    monkeypatch.setattr(
++        routes_openai,
++        "handle_gemini_generate_content",
++        AsyncMock(return_value=StreamingResponse(events())),
++    )
++    async with _client() as client:
++        result = await client.post(
++            "/v1/chat/completions",
++            json=_payload(stream=True, stream_options={"include_usage": include_usage}),
++        )
++    assert result.status_code == 200
++    assert result.headers["content-type"].startswith("text/event-stream")
++    assert result.text.endswith("data: [DONE]\n\n")
++    frames = [
++        json.loads(line[6:])
++        for line in result.text.splitlines()
++        if line.startswith("data: {")
++    ]
++    assert len({frame["id"] for frame in frames}) == 1
++    assert len({frame["created"] for frame in frames}) == 1
++    assert frames[0]["choices"][0]["delta"]["role"] == "assistant"
++    assert (
++        "".join(
++            choice["delta"].get("content", "")
++            for frame in frames
++            for choice in frame["choices"]
++        )
++        == "你好世界"
++    )
++    finishes = [
++        choice["finish_reason"]
++        for frame in frames
++        for choice in frame["choices"]
++        if choice["finish_reason"]
++    ]
++    assert finishes == ["stop"]
++    if include_usage:
++        assert frames[-1]["choices"] == []
++        assert frames[-1]["usage"]["total_tokens"] == 10
++        assert all(frame["usage"] is None for frame in frames[:-1])
++    else:
++        assert all("usage" not in frame for frame in frames)
++    assert closed == [True]
++
++
++@pytest.mark.asyncio
++async def test_stream_error_does_not_report_success(monkeypatch, client_stub):
++    async def events():
++        yield format_sse_error(HTTPException(429, detail="quota exhausted"))
++
++    monkeypatch.setattr(
++        routes_openai,
++        "handle_gemini_generate_content",
++        AsyncMock(return_value=StreamingResponse(events())),
++    )
++    async with _client() as client:
++        result = await client.post("/v1/chat/completions", json=_payload(stream=True))
++    frames = [
++        json.loads(line[6:])
++        for line in result.text.splitlines()
++        if line.startswith("data: {")
++    ]
++    assert frames[-1]["error"]["type"] == "rate_limit_error"
++    assert frames[-1]["error"]["code"] == 429
++    assert all(
++        not choice["finish_reason"]
++        for frame in frames
++        for choice in frame.get("choices", [])
++    )
++
++
++@pytest.mark.asyncio
++async def test_stream_closes_upstream_when_consumer_disconnects():
++    closed = []
++
++    async def events():
++        try:
++            yield format_sse_event("body", "partial") or ""
++            raise AssertionError("Disconnected client must not consume more output")
++        finally:
++            closed.append(True)
++
++    stream = routes_openai._stream_openai(
++        StreamingResponse(events()),
++        model="test",
++        completion_id="test-id",
++        created=1,
++        include_usage=False,
++    )
++    await anext(stream)  # role
++    await anext(stream)  # first body
++    await stream.aclose()
++    assert closed == [True]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "change",
++    [
++        {"messages": []},
++        {
++            "messages": [
++                {
++                    "role": "user",
++                    "content": [{"type": "image_url", "image_url": {"url": "example"}}],
++                }
++            ]
++        },
++        {"messages": [{"role": "tool", "content": "result"}]},
++        {"tools": [{"type": "function"}]},
++        {"n": 2},
++        {"model": "models/"},
++        {"max_tokens": 0},
++        {"response_format": {"type": "json_schema"}},
++    ],
++)
++async def test_unsupported_requests_fail_before_generation(
++    monkeypatch, client_stub, change
++):
++    generate = AsyncMock()
++    monkeypatch.setattr(routes_openai, "handle_gemini_generate_content", generate)
++    async with _client() as client:
++        response = await client.post("/v1/chat/completions", json=_payload(**change))
++    assert response.status_code == 400
++    assert response.json()["error"]["type"] == "invalid_request_error"
++    generate.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_generation_error_preserves_status(monkeypatch, client_stub):
++    monkeypatch.setattr(
++        routes_openai,
++        "handle_gemini_generate_content",
++        AsyncMock(side_effect=HTTPException(403, detail="permission denied")),
++    )
++    async with _client() as client:
++        response = await client.post("/v1/chat/completions", json=_payload())
++    assert response.status_code == 403
++    assert response.json()["error"]["message"] == "permission denied"
++    assert response.json()["error"]["type"] == "authentication_error"
+diff --git a/tests/unit/test_routes_models.py b/tests/unit/test_routes_models.py
+index 1db4be9fc5d5f257d9f0aecafa0d361df9a3e546..39897cf4ea7f7af52f63ebf9515c00f94ac686a8 100644
+--- a/tests/unit/test_routes_models.py
++++ b/tests/unit/test_routes_models.py
+@@ -42,11 +42,16 @@ async def test_get_single_model_returns_model_object(monkeypatch):
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_v1_models_endpoint_is_removed(monkeypatch):
++async def test_v1_models_endpoint_returns_openai_format(monkeypatch):
+     monkeypatch.setattr(settings, "api_keys", frozenset())
+     async with _build_client() as client:
+         response = await client.get("/v1/models")
+-        assert response.status_code == 404
++        assert response.status_code == 200
++        data = response.json()
++        assert data["object"] == "list"
++        assert data["data"]
++        assert data["data"][0]["object"] == "model"
++        assert not data["data"][0]["id"].startswith("models/")
+ 
+ 
+ @pytest.mark.asyncio
