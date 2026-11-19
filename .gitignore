@@ -2,3 +2,7 @@ local-key.txt
 browser-profile/
 account-profiles/
 accounts.sqlite3*
+.env
+data/
+server-logs/
+dumps/
