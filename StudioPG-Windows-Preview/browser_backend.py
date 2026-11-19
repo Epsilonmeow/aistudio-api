@@ -87,8 +87,12 @@ class BrowserBackend:
         if self._context is context:
             self._context = None
 
+    @property
+    def window_open(self) -> bool:
+        return self._context is not None and not self._context.is_closed()
+
     async def _browser(self, *, first_run=False):
-        if self._context is not None:
+        if self.window_open:
             return self._context
         marker = self._profile / MARKER
         if not marker.is_file():
@@ -139,13 +143,26 @@ class BrowserBackend:
     async def close(self):
         async with self._lock:
             try:
-                if self._context is not None:
+                if self.window_open:
                     await self._context.close()
             finally:
                 self._context = None
                 if self._driver is not None:
                     await self._driver.stop()
                     self._driver = None
+
+    async def _new_chat_page(self):
+        ctx = await self._browser()
+        try:
+            return await ctx.new_page()
+        except Error:
+            # A browser can exit between choosing its profile and creating the tab.
+            # Nothing has been submitted. Only reopen this same local profile.
+            if not ctx.is_closed() and (ctx.browser is None or ctx.browser.is_connected()):
+                raise
+            self._context_closed(ctx)
+            ctx = await self._browser()
+            return await ctx.new_page()
 
     async def generate(self, prompt: str, max_tokens: int | None):
         # The Web UI determines the generation limit. It does not expose an
@@ -156,8 +173,7 @@ class BrowserBackend:
         async with self._lock:
             page = None
             try:
-                ctx = await self._browser()
-                page = await ctx.new_page()
+                page = await self._new_chat_page()
                 await _navigate(page)
                 await self._submit_once(page, prompt)
                 async for text in self._visible_reply(page):

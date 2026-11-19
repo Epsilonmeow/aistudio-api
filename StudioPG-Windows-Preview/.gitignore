@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .env
+local-key.txt
+browser-profile/
+account-profiles/
+accounts.sqlite3*

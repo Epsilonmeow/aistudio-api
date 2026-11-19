@@ -1,2 +1,4 @@
 local-key.txt
 browser-profile/
+account-profiles/
+accounts.sqlite3*

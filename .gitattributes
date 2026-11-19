@@ -1,4 +1,5 @@
 *.patch -text whitespace=-blank-at-eol
-/StudioPG-Windows-Preview.zip binary
+/StudioPG-Windows-*.zip binary
+/SHA256SUMS.txt -text whitespace=cr-at-eol
 /StudioPG-Windows-Preview/** -text
 /StudioPG-Windows-Preview/*.cmd whitespace=cr-at-eol

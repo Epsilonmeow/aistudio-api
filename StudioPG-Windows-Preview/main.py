@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from contextlib import suppress
 from pathlib import Path
 
 import uvicorn
-from browser_backend import BrowserBackend
+from accounts import AccountPool
 from fastapi.responses import PlainTextResponse
 from protocol_api import BackendError, create_app
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -61,13 +62,13 @@ def listen(port: int = 8080) -> socket.socket:
         raise
 
 
-def build_app(backend: BrowserBackend, key: str):
+def build_app(backend: AccountPool, key: str):
     app = create_app(backend, key)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
     async def home(_request):
         return PlainTextResponse(
-            "本机 PG 服务已启动。回到启动窗口，按 L 打开专用登录窗口，"
+            "本机 PG 服务已启动。回到启动窗口，按 M 查看账号，按 L 打开选中账号的登录窗口，"
             "按 K 复制酒馆连接密钥。登录状态以专用浏览器里的网页为准。"
         )
 
@@ -76,13 +77,22 @@ def build_app(backend: BrowserBackend, key: str):
     return app
 
 
-async def console(backend: BrowserBackend, key: str):
+def print_accounts(backend: AccountPool, selected: int):
+    for number, enabled in backend.accounts():
+        focus = " ← 当前管理" if number == selected else ""
+        print(f"账号 {number}　{'参与轮换' if enabled else '已暂停'}{focus}", flush=True)
+    print("M 查看　S 选下一个　A 新建　L 登录所选账号　E 启用/暂停　K 复制密钥", flush=True)
+
+
+async def console(backend: AccountPool, key: str):
     import msvcrt
 
-    async def login():
+    selected = 1
+
+    async def login(number: int):
         try:
-            await backend.open_login()
-            print("请在专用浏览器里确认登录，并留意网页上选用的模型。", flush=True)
+            await backend.open_login(number)
+            print(f"请在账号 {number} 的专用浏览器确认登录。新建账号登录后，回到窗口按 E 启用。", flush=True)
         except BackendError as exc:
             print(str(exc), flush=True)
         except Exception:
@@ -98,8 +108,21 @@ async def console(backend: BrowserBackend, key: str):
             if not msvcrt.kbhit():
                 continue
             command = msvcrt.getwch().lower()
-            if command == "l" and (task is None or task.done()):
-                task = asyncio.create_task(login())
+            if command == "m":
+                print_accounts(backend, selected)
+            elif command == "s":
+                ids = [number for number, _ in backend.accounts()]
+                selected = ids[(ids.index(selected) + 1) % len(ids)]
+                print_accounts(backend, selected)
+            elif command == "a":
+                selected = backend.add()
+                print_accounts(backend, selected)
+            elif command == "e":
+                enabled = dict(backend.accounts())[selected]
+                backend.set_enabled(selected, not enabled)
+                print_accounts(backend, selected)
+            elif command == "l" and (task is None or task.done()):
+                task = asyncio.create_task(login(selected))
             elif command == "k":
                 try:
                     clip = Path(os.environ["SYSTEMROOT"]) / "System32" / "clip.exe"
@@ -125,7 +148,7 @@ async def console(backend: BrowserBackend, key: str):
 async def serve(listener: socket.socket):
     root = state_directory()
     key = local_key(root)
-    backend = BrowserBackend(root / "browser-profile")
+    backend = AccountPool(root)
     app = build_app(backend, key)
     server = uvicorn.Server(
         uvicorn.Config(
@@ -138,7 +161,8 @@ async def serve(listener: socket.socket):
         )
     )
     print(f"本机服务  http://127.0.0.1:{listener.getsockname()[1]}", flush=True)
-    print("按 L 打开登录窗口，按 K 复制连接密钥，按 Ctrl+C 退出。", flush=True)
+    print_accounts(backend, 1)
+    print("按 Ctrl+C 退出。", flush=True)
     task = asyncio.create_task(console(backend, key)) if sys.stdin.isatty() else None
     try:
         await server.serve(sockets=[listener])
@@ -163,7 +187,7 @@ def main() -> int:
             asyncio.run(serve(listener))
     except KeyboardInterrupt:
         pass
-    except (OSError, RuntimeError, UnicodeError) as exc:
+    except (OSError, RuntimeError, UnicodeError, sqlite3.Error) as exc:
         print(f"启动失败：{exc}")
         return 1
     return 0
