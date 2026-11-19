@@ -1,1 +1,4 @@
 *.patch -text whitespace=-blank-at-eol
+/StudioPG-Windows-Preview.zip binary
+/StudioPG-Windows-Preview/** -text
+/StudioPG-Windows-Preview/*.cmd whitespace=cr-at-eol
