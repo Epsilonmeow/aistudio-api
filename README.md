@@ -4,7 +4,7 @@
 
 ## 第一次安装
 
-1. [下载 Windows 单账号预览版 ZIP](https://github.com/Epsilonmeow/aistudio-api/raw/refs/heads/codex/windows-sillytavern/StudioPG-Windows-Preview.zip)，在 Windows 上右键选择「全部解压」。
+1. [下载 Windows 单账号预览版 ZIP（v0.1.0-preview.1）](https://github.com/Epsilonmeow/aistudio-api/releases/download/v0.1.0-preview.1/StudioPG-Windows-Preview.zip) · [校验文件 SHA256SUMS.txt](https://github.com/Epsilonmeow/aistudio-api/releases/download/v0.1.0-preview.1/SHA256SUMS.txt)。右键下载的 ZIP，选择「全部解压」。
 2. 准备好 Edge 或 Chrome，按[新手安装说明](./StudioPG-Windows-Preview/README.md)装好 uv，再双击解压目录里的 **启动.cmd**。第一次启动会自动准备运行环境。
 3. 在启动窗口按 **L** 登录自己的 Google 账号，按 **K** 复制本机生成的连接密钥。酒馆和服务装在同一台电脑时，按下表填写。
 
